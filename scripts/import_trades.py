@@ -1,8 +1,8 @@
 # Python Importer File to be run manually at the end of the trading day 
 # Command to start PPro8 API: PPro8.exe -pproapi_port=8080
-# Check in browser: http://localhost:8080/GetTransactions?user=YOUR_USER
+# Check in browser that API is accessible: http://localhost:8080/GetTransactions?user=YOUR_USER
 # Note: PPro8 must still be running to work 
-# To run the importer: import_trades.py
+# To run the importer: python -m scripts.import_trades
 
 import hashlib
 import json
@@ -12,9 +12,22 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
+from collections import defaultdict
+from dataclasses import dataclass, field
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Tuple
 
 import psycopg
 import requests
+
+MONEY_QUANT = Decimal("0.01")
+PRICE_QUANT = Decimal("0.0001")
+
+def quantize_money(value: Decimal) -> Decimal:
+    return value.quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
+
+def quantize_price(value: Decimal) -> Decimal:
+    return value.quantize(PRICE_QUANT, rounding=ROUND_HALF_UP)
 
 
 # -----------------------------------------------------------------------------
@@ -23,7 +36,7 @@ import requests
 
 from scripts.config import DB_CONFIG, PPRO_BASE_URL, PPRO_USER_ID
 
-# REQUEST_TIMEOUT_SECONDS = 20
+REQUEST_TIMEOUT_SECONDS = 20
 
 
 # -----------------------------------------------------------------------------
@@ -326,7 +339,7 @@ def normalize_record(record: Dict[str, Any], source_type: str, user_id: str) -> 
         "user_id": user_id,
         "region_id": text_to_int(record.get("id") or record.get("RegionId")),
         "region_name": record.get("name") or record.get("RegionName"),
-        "message_type": record.get("Transaction") or record.get("MessageType"),
+        "message_type": record.get("Message") or record.get("MessageType"),
         "message": record.get("Message"),
         "market_datetime": market_dt,
         "client_datetime": client_dt,
@@ -354,10 +367,19 @@ def normalize_record(record: Dict[str, Any], source_type: str, user_id: str) -> 
         "open_size": text_to_int(record.get("OpenSz")),
         "shares": text_to_int(record.get("Shares")),
         "position": text_to_int(record.get("Position")),
-        "currency_charge_giveup": text_to_decimal(record.get("CurrencyChargeGiveup")),
-        "currency_charge_act": text_to_decimal(record.get("CurrencyChargeAct")),
-        "currency_charge_exec": text_to_decimal(record.get("CurrencyChargeExec")),
-        "currency_charge_clear": text_to_decimal(record.get("CurrencyChargeClr")),
+        "currency_charge_giveup": text_to_decimal(
+            record.get("ChargeGway") or record.get("CurrencyChargeGiveup")
+        ),
+        "currency_charge_act": text_to_decimal(
+            record.get("ChargeAct") or record.get("CurrencyChargeAct")
+        ),
+        "currency_charge_exec": text_to_decimal(
+            record.get("ChargeExec") or record.get("CurrencyChargeExec")
+        ),
+        "currency_charge_clear": text_to_decimal(
+            record.get("ChargeClr") or record.get("CurrencyChargeClr")
+        ),
+        "charge_sec": text_to_decimal(record.get("ChargeSec")),
         "via_api": text_to_bool(record.get("ViaApi")),
         "raw_record": json.dumps(record, default=str),
     }
@@ -504,6 +526,7 @@ def insert_trade_event(
             currency_charge_act,
             currency_charge_exec,
             currency_charge_clear,
+            charge_sec,
             via_api,
             raw_record,
             event_hash
@@ -512,7 +535,8 @@ def insert_trade_event(
             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 
+            %s, %s
         )
         ON CONFLICT (source_type, user_id, event_hash) DO NOTHING
         """,
@@ -555,6 +579,7 @@ def insert_trade_event(
             row["currency_charge_act"],
             row["currency_charge_exec"],
             row["currency_charge_clear"],
+            row["charge_sec"],
             row["via_api"],
             row["raw_record"],
             row["event_hash"],
@@ -630,10 +655,13 @@ def rebuild_daily_summary(
                 SELECT symbol
                 FROM trade_events te2
                 WHERE te2.user_id = %s
-                  AND te2.trade_date = %s
-                  AND symbol IS NOT NULL
+                    AND te2.trade_date = %s
+                    AND te2.source_type = 'get_transactions'
+                    AND te2.order_state IN ('Filled', 'Partially Filled')
+                    AND te2.side IN ('B', 'S', 'T')
+                    AND te2.symbol IS NOT NULL
                 GROUP BY symbol
-                ORDER BY COUNT(*) DESC, symbol
+                ORDER BY SUM(shares) DESC, symbol
                 LIMIT 1
             ),
             'Initial summary build; refine realized P/L after validating real payloads.',
@@ -641,6 +669,10 @@ def rebuild_daily_summary(
         FROM trade_events te
         WHERE te.user_id = %s
           AND te.trade_date = %s
+          AND te.source_type = 'get_transactions'
+          AND te.order_state IN ('Filled', 'Partially Filled')
+          AND te.side IN ('B', 'S', 'T')
+          AND te.symbol IS NOT NULL
         ON CONFLICT (summary_date, user_id)
         DO UPDATE SET
             import_batch_id = EXCLUDED.import_batch_id,
@@ -730,6 +762,314 @@ def import_source(
 
     return len(records)
 
+# -----------------------------------------------------------------------------
+# Tracks Trading Positions
+# -----------------------------------------------------------------------------
+
+@dataclass
+class OpenPosition:
+    """
+    Tracks the currently open position for one symbol.
+
+    Attributes:
+        symbol: Ticker symbol.
+        user_id: Trader/user identifier.
+        side_open: LONG or SHORT once established.
+        entry_time: Timestamp of the first opening execution.
+        position_qty: Signed quantity. Positive for long, negative for short.
+        avg_entry_price: Weighted average entry price for the currently open position.
+        accumulated_fees: Running fees for the open trade.
+        entry_order_numbers: Order numbers contributing to the opening side.
+        exit_order_numbers: Order numbers contributing to the closing side.
+    """
+    symbol: str
+    user_id: str
+    side_open: str | None = None
+    entry_time: datetime | None = None
+    position_qty: int = 0
+    avg_entry_price: Decimal = Decimal("0")
+    accumulated_fees: Decimal = Decimal("0")
+    entry_order_numbers: list[str] = field(default_factory=list)
+    exit_order_numbers: list[str] = field(default_factory=list)
+
+
+def decimal_or_zero(value: Any) -> Decimal:
+    """
+    Returns a Decimal value or zero if the input is None.
+    """
+    if value is None:
+        return Decimal("0")
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
+def compute_event_fee(row):
+    """
+    Match PPro behavior:
+    - round each component at event level
+    - then sum
+    """
+
+    fee = (
+        decimal_or_zero(row.get("currency_charge_act")) +
+        decimal_or_zero(row.get("currency_charge_exec")) +
+        decimal_or_zero(row.get("currency_charge_clear")) +
+        decimal_or_zero(row.get("charge_sec"))
+    )
+
+    # 🔥 KEY FIX: round per event
+    return quantize_money(fee)
+
+def get_event_exec_qty(row: Dict[str, Any]) -> int:
+    """
+    Returns the actual executed quantity for an event row.
+    Prefers execution-specific fields over generic shares.
+    """
+    if row.get("exec_size") is not None and int(row["exec_size"]) > 0:
+        return int(row["exec_size"])
+    if row.get("fill_size") is not None and int(row["fill_size"]) > 0:
+        return int(row["fill_size"])
+    return int(row["shares"])
+
+def fetch_execution_events(cur: psycopg.Cursor, user_id: str) -> list[Dict[str, Any]]:
+    """
+    Fetches execution-related rows from trade_events using GetTransactions only.
+
+    This avoids double counting duplicate execution rows also present in GetBlotter.
+    """
+    cur.execute(
+        """
+        SELECT
+            user_id,
+            symbol,
+            side,
+            order_state,
+            shares,
+            price,
+            market_datetime,
+            order_number,
+            currency_charge_giveup,
+            currency_charge_act,
+            currency_charge_exec,
+            currency_charge_clear,
+            charge_sec,
+            source_type
+        FROM public.trade_events
+        WHERE user_id = %s
+          AND source_type = 'get_transactions'
+          AND order_state IN ('Filled', 'Partially Filled')
+          AND symbol IS NOT NULL
+          AND side IN ('B', 'S', 'T')
+          AND shares IS NOT NULL
+          AND price IS NOT NULL
+          AND market_datetime IS NOT NULL
+        ORDER BY symbol, market_datetime, order_number
+        """,
+        (user_id,),
+    )
+
+    columns = [desc[0] for desc in cur.description]
+    rows = cur.fetchall()
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def build_completed_trades(events: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    """
+    Builds completed trades from canonical execution events.
+
+    Supports:
+    - long and short trades
+    - partial fills
+    - multi-fill entries and exits
+    - scaling in and scaling out
+
+    A trade is completed when net position returns to zero.
+    """
+    completed_trades: list[Dict[str, Any]] = []
+    positions: dict[tuple[str, str], Dict[str, Any]] = {}
+
+    for row in events:
+        symbol = row["symbol"]
+        user_id = row["user_id"]
+        key = (user_id, symbol)
+
+        qty = get_event_exec_qty(row)
+        price = decimal_or_zero(row["price"])
+        side = row["side"]
+        event_time = row["market_datetime"]
+        order_number = row["order_number"]
+        fee = compute_event_fee(row)
+
+        if side == "B":
+            signed_qty = qty
+        elif side in ("S", "T"):
+            signed_qty = -qty
+        else:
+            continue
+
+        if key not in positions or not positions[key]:
+            positions[key] = {
+                "symbol": symbol,
+                "user_id": user_id,
+                "entry_time": None,
+                "side_open": None,
+                "position": 0,
+                "entry_qty": 0,
+                "entry_value": Decimal("0"),
+                "exit_qty": 0,
+                "exit_value": Decimal("0"),
+                "fees": Decimal("0"),
+                "entry_orders": [],
+                "exit_orders": [],
+            }
+
+        pos = positions[key]
+
+        if pos["position"] == 0:
+            pos["entry_time"] = event_time
+            pos["side_open"] = "LONG" if signed_qty > 0 else "SHORT"
+
+        pos["fees"] += fee
+
+        same_direction = (
+            (pos["position"] >= 0 and signed_qty > 0) or
+            (pos["position"] <= 0 and signed_qty < 0)
+        )
+
+        if same_direction:
+            pos["entry_qty"] += qty
+            pos["entry_value"] += price * Decimal(qty)
+
+            if order_number:
+                pos["entry_orders"].append(order_number)
+
+            pos["position"] += signed_qty
+            continue
+
+        close_qty = min(abs(pos["position"]), abs(signed_qty))
+
+        pos["exit_qty"] += close_qty
+        pos["exit_value"] += price * Decimal(close_qty)
+
+        if order_number:
+            pos["exit_orders"].append(order_number)
+
+        pos["position"] += signed_qty
+
+        if pos["position"] == 0 and pos["entry_qty"] > 0 and pos["exit_qty"] > 0:
+            entry_avg = quantize_price(pos["entry_value"] / Decimal(pos["entry_qty"]))
+            exit_avg = quantize_price(pos["exit_value"] / Decimal(pos["exit_qty"]))
+
+            closed_shares = min(pos["entry_qty"], pos["exit_qty"])
+            side_open = pos["side_open"]
+
+            if side_open == "LONG":
+                gross_pl = (exit_avg - entry_avg) * Decimal(closed_shares)
+            else:
+                gross_pl = (entry_avg - exit_avg) * Decimal(closed_shares)
+
+            completed_trades.append({
+                "user_id": user_id,
+                "symbol": symbol,
+                "side_open": side_open,
+                "entry_time": pos["entry_time"],
+                "exit_time": event_time,
+                "entry_avg_price": quantize_money(entry_avg),
+                "exit_avg_price": quantize_money(exit_avg),
+                "total_shares": closed_shares,
+                "gross_pl": quantize_money(gross_pl),
+                "total_fees": quantize_money(pos["fees"]),
+                "net_pl": quantize_money(gross_pl - pos["fees"]),
+                "entry_order_numbers": pos["entry_orders"],
+                "exit_order_numbers": pos["exit_orders"],
+                "source_notes": "Fill-aware trade reconstruction",
+            })
+
+            positions[key] = {}
+
+    return completed_trades
+
+
+def clear_trades_table(cur: psycopg.Cursor, user_id: str) -> None:
+    """
+    Clears existing derived trades for a user before rebuilding.
+    """
+    cur.execute(
+        "DELETE FROM public.trades WHERE user_id = %s",
+        (user_id,),
+    )
+
+
+def insert_completed_trade(
+    cur: psycopg.Cursor,
+    import_batch_id: uuid.UUID,
+    trade: Dict[str, Any],
+) -> None:
+    """
+    Inserts one completed trade into the trades table.
+    """
+    cur.execute(
+        """
+        INSERT INTO public.trades (
+            import_batch_id,
+            user_id,
+            symbol,
+            side_open,
+            entry_time,
+            exit_time,
+            entry_avg_price,
+            exit_avg_price,
+            total_shares,
+            gross_pl,
+            total_fees,
+            net_pl,
+            entry_order_numbers,
+            exit_order_numbers,
+            source_notes
+        )
+        VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+        )
+        """,
+        (
+            import_batch_id,
+            trade["user_id"],
+            trade["symbol"],
+            trade["side_open"],
+            trade["entry_time"],
+            trade["exit_time"],
+            trade["entry_avg_price"],
+            trade["exit_avg_price"],
+            trade["total_shares"],
+            trade["gross_pl"],
+            trade["total_fees"],
+            trade["net_pl"],
+            trade["entry_order_numbers"],
+            trade["exit_order_numbers"],
+            trade["source_notes"],
+        ),
+    )
+
+
+def rebuild_trades(cur: psycopg.Cursor, import_batch_id: uuid.UUID, user_id: str) -> int:
+    """
+    Rebuilds derived completed trades from canonical execution events.
+    """
+    events = fetch_execution_events(cur, user_id)
+    completed = build_completed_trades(events)
+
+    clear_trades_table(cur, user_id)
+
+    for trade in completed:
+        insert_completed_trade(cur, import_batch_id, trade)
+
+    logger.info("Rebuilt %s completed trades for user=%s", len(completed), user_id)
+    return len(completed)
+
+# -----------------------------------------------------------------------------
+# Import End of Day
+# -----------------------------------------------------------------------------
 
 def import_end_of_day() -> None:
     """
@@ -781,12 +1121,19 @@ def import_end_of_day() -> None:
                     summary_date=today,
                 )
 
+                trade_count = rebuild_trades(
+                    cur=cur,
+                    import_batch_id=import_batch_id,
+                    user_id=PPRO_USER_ID,
+                )
+
             conn.commit()
             logger.info(
-                "Import successful. Batch ID: %s | GetTransactions: %s | GetBlotter: %s",
+                "Import successful. Batch ID: %s | GetTransactions: %s | GetBlotter: %s | Trades: %s",
                 import_batch_id,
                 tx_count,
                 blotter_count,
+                trade_count,
             )
 
         except Exception as exc:

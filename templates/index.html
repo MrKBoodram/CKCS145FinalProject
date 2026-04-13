@@ -1,18 +1,180 @@
 <!DOCTYPE html>
 
-<html>
+<html lang="en">
 
 <head>
-
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>My Trading Journal</title>
+    <link rel="stylesheet" href="{{url_for('static', filename='css/style.css') }}" />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="icon" href="{{url_for('static', filename='img/icons8-stocks-color-hand-drawn-96.png')}}" type="image/png">
 </head>
 
 <body>
 
-    <h1>My Webpage</h1>
-    <p>
-        Welcome to my placeholder 
-    </p>
+    <nav class="top-nav">
+        <div class="nav-left">
+            <img
+                src="{{ url_for('static', filename='img/BlueProfilePic-01.png') }}"
+                alt="Trading Journal Logo"
+                class="nav-logo"
+            >
+            <div class="nav-brand">
+                <span class="brand-title">Kevin's Trading Journal</span>
+                <span class="brand-subtitle">Performance Dashboard</span>
+            </div>
+        </div>
 
+        <div class="nav-right">
+            <a href="#pnl-tab" class="nav-link">Daily P/L</a>
+            <a href="#trades-tab" class="nav-link">Trades</a>
+            <a href="#symbols-tab" class="nav-link">Symbols</a>
+        </div>
+    </nav>
+
+    <div class="page">
+        <header class="hero">
+            <h1>My Dashboard</h1>
+            <p>
+                Welcome to my trading journal! Here you can view trades, analyze performance, and gain insights into trading strategies. Navigate different sections of my journal, including performance summary, daily P/L, completed trades, along with other metrics and visualizations. I suggest that you start logging your trades today and take control of your trading journey! All the best! 
+            </p>
+        </header>
+
+        <section class="card-grid" id="summary-cards">
+            <div class="card stat-card">
+                <h3>Total Trades</h3>
+                <p id="total-trades">-</p>
+            </div>
+            <div class="card stat-card">
+                <h3>Total Shares</h3>
+                <p id="total-shares">-</p>
+            </div>
+            <div class="card stat-card">
+                <h3>Gross P/L</h3>
+                <p id="gross-pl">-</p>
+            </div>
+            <div class="card stat-card">
+                <h3>Fees</h3>
+                <p id="total-fees">-</p>
+            </div>
+            <div class="card stat-card">
+                <h3>Net P/L</h3>
+                <p id="net-pl">-</p>
+            </div>
+            <div class="card stat-card">
+                <h3>Win Rate</h3>
+                <p id="win-rate">-</p>
+            </div>
+        </section>
+
+        <section class="tabs">
+            <button class="tab-button active" data-tab="pnl-tab">Daily P/L</button>
+            <button class="tab-button" data-tab="trades-tab">Completed Trades</button>
+            <button class="tab-button" data-tab="symbols-tab">Symbol Breakdown</button>
+        </section>
+
+        <section class="tab-panel active" id="pnl-tab">
+            <div class="card">
+                <h2>Daily Net P/L</h2>
+                <canvas id="dailyPnlChart"></canvas>
+            </div>
+        </section>
+
+        <section class="tab-panel" id="trades-tab">
+            <div class="card">
+                <h2>Completed Trades</h2>
+                <div class="table-wrap">
+                    <table id="trades-table">
+                        <thead>
+                            <tr>
+                                <th>Symbol</th>
+                                <th>Side</th>
+                                <th>Entry Time</th>
+                                <th>Exit Time</th>
+                                <th>Shares</th>
+                                <th>Entry Avg</th>
+                                <th>Exit Avg</th>
+                                <th>Gross P/L</th>
+                                <th>Fees</th>
+                                <th>Net P/L</th>
+                            </tr>
+                        </thead>
+                        <tbody id="trades-table-body">
+                            <!-- Trade rows will be dynamically inserted here -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+        
+        <section class="tab-panel" id="symbols-tab">
+            <div class="card">
+                <h2>Symbol Breakdown</h2>
+                <div class="table-wrap">
+                    <table id="symbols-table">
+                        <thead>
+                            <tr>
+                                <th>Symbol</th>
+                                <th>Trades</th>
+                                <th>Total Shares</th>
+                                <th>Gross P/L</th>
+                                <th>Fees</th>
+                                <th>Net P/L</th>
+                            </tr>
+                        </thead>
+                        <tbody id="symbols-table-body">
+                            <!-- Symbol breakdown rows will be dynamically inserted here -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <section class="contact-section">
+            <div class="contact-card">
+                <h2>Contact Me</h2>
+                <p>For any inquiries or feedback, feel free to reach out!</p>
+                <p>
+                    <a href="mailto:mrboodram@protonmail.com?subject=Trading Journal Inquiry&body=Hi Kevin,%0D%0A%0D%0AI saw your trading dashboard and wanted to reach out..." class="contact-link">
+                        mrboodram@protonmail.com
+                    </a>
+                </p>
+            </div>
+        </section>
+
+    </div>
+    
+    <script src="{{url_for('static', filename='js/scripts.js') }}"></script>
 </body>
 
+<footer style="margin-top: 40px; font-size: 12px; color: #94a3b8; text-align: center;">
+
+    <p>© 2026 Trading Journal · Built by Kevin Boodram</p>
+    <p>Version 0.1 · MVP</p>
+    <p>Last Updated: April 2026</p>
+
+    <p>
+        <a href="#pnl-tab">P/L</a> ·
+        <a href="#trades-tab">Trades</a> ·
+        <a href="#symbols-tab">Symbols</a>
+    </p>
+
+    <p style="font-size: 11px; opacity: 0.7;">
+        For personal use only. Data may be delayed or incomplete. Not financial advice.
+    </p>
+
+    <p>
+        <a href="https://github.com/MrKBoodram/CKCS145FinalProject" target="_blank">
+            View Source
+        </a>
+    </p>
+
+    <p>
+        <a target="_blank" href="https://icons8.com/icon/A1AC4LBKeWFA/stocks">Stocks</a>
+        icon by
+        <a target="_blank" href="https://icons8.com">Icons8</a>
+    </p>
+
+</footer>
 </html>
